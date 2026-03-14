@@ -74,7 +74,7 @@ class BinWithObjectsEnv(TaskEnv):
         robot_uids: Robot to use (default: "panda").
     """
 
-    SUPPORTED_ROBOTS = ["panda"]
+    SUPPORTED_ROBOTS = ["panda", "ur5_robotiq", "ur5e_robotiq"]
     SUPPORTED_REWARD_MODES = ["none"]
     agent: Union[Panda]
 
@@ -209,10 +209,13 @@ class BinWithObjectsEnv(TaskEnv):
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         with torch.device(self.device):
             self.table_scene.initialize(env_idx)
+            self._after_table_scene_init(env_idx)
 
             # Move robot out of the way during settling
             self.agent.robot.set_root_pose(sapien.Pose(p=[-5, 0, 0]))
-            self.agent.reset(np.array([0, -1.5, 0, -2.5, 0, 1.0, 0.8, 0.04, 0.04]))
+            n_joints = len(self.agent.robot.get_active_joints())
+            park_qpos = np.zeros(n_joints)
+            self.agent.reset(park_qpos)
 
             # Place bin on table
             cx, cy = self.BIN_CENTER

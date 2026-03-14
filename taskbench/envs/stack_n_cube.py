@@ -43,7 +43,7 @@ class StackNCubeEnv(TaskEnv):
         robot_init_qpos_noise: Noise added to robot initial joint positions.
     """
 
-    SUPPORTED_ROBOTS = ["panda_wristcam", "panda", "fetch"]
+    SUPPORTED_ROBOTS = ["panda_wristcam", "panda", "fetch", "ur5_robotiq", "ur5e_robotiq"]
     SUPPORTED_REWARD_MODES = ["sparse", "none"]
     agent: Union[Panda, Fetch]
 
@@ -106,6 +106,7 @@ class StackNCubeEnv(TaskEnv):
         with torch.device(self.device):
             b = len(env_idx)
             self.table_scene.initialize(env_idx)
+            self._after_table_scene_init(env_idx)
 
             xyz = torch.zeros((b, 3))
             xyz[:, 2] = 0.02  # half cube height above table

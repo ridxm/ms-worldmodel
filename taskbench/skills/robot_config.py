@@ -33,6 +33,47 @@ ROBOT_CONFIGS: dict[str, RobotConfig] = {
             {"panda_hand", "panda_leftfinger", "panda_rightfinger"}
         ),
     ),
+    "ur5_robotiq": RobotConfig(
+        move_group="eef",
+        finger_length=0.035,
+        gripper_link_names=frozenset(
+            {
+                "robotiq_arg2f_base_link",
+                "left_inner_finger_pad",
+                "right_inner_finger_pad",
+                "left_inner_finger",
+                "right_inner_finger",
+                "left_outer_finger",
+                "right_outer_finger",
+            }
+        ),
+        gripper_open=0.0,
+        gripper_closed=0.81,
+    ),
+    "ur5e_robotiq": RobotConfig(
+        move_group="eef",
+        finger_length=0.035,
+        gripper_link_names=frozenset(
+            {
+                "robotiq_base_mount",
+                "robotiq_base",
+                "left_driver",
+                "left_coupler",
+                "left_spring_link",
+                "left_follower",
+                "left_pad",
+                "left_silicone_pad",
+                "right_driver",
+                "right_coupler",
+                "right_spring_link",
+                "right_follower",
+                "right_pad",
+                "right_silicone_pad",
+            }
+        ),
+        gripper_open=0.0,
+        gripper_closed=-0.8,
+    ),
 }
 
 

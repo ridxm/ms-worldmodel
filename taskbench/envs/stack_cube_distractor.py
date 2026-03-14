@@ -37,6 +37,7 @@ class StackCubeDistractorEnv(StackCubeEnv):
         with torch.device(self.device):
             b = len(env_idx)
             self.table_scene.initialize(env_idx)
+            self._after_table_scene_init(env_idx)
 
             xyz = torch.zeros((b, 3))
             xyz[:, 2] = 0.02

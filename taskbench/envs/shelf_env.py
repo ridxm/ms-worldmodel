@@ -66,7 +66,7 @@ class ShelfEnv(TaskEnv):
         robot_uids: Robot to use (default: "panda").
     """
 
-    SUPPORTED_ROBOTS = ["panda"]
+    SUPPORTED_ROBOTS = ["panda", "ur5_robotiq", "ur5e_robotiq"]
     SUPPORTED_REWARD_MODES = ["none"]
     agent: Union[Panda]
 

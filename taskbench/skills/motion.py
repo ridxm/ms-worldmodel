@@ -94,6 +94,10 @@ def _add_table_collision(env, planner):
         xx, yy = np.meshgrid(xs, ys)
         zz = np.full_like(xx, table_z)
         points = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=-1)
+        # Exclude points near the robot base to avoid false collisions.
+        base_p = np.asarray(raw.agent.robot.pose.p, dtype=np.float64).flatten()[:3]
+        dist_sq = (points[:, 0] - base_p[0]) ** 2 + (points[:, 1] - base_p[1]) ** 2
+        points = points[dist_sq > 0.15**2]
         planner.update_point_cloud(points, resolution=0.02, name="table")
         logger.debug(
             "Added table collision: %d points at z=%.4f", len(points), top_z
@@ -152,6 +156,35 @@ def _box_surface_points(center, half_size, res):
     return np.concatenate(faces, axis=0)
 
 
+def _get_srdf_path(agent) -> str:
+    """Get or auto-generate an SRDF file for the agent's URDF.
+
+    For MJCF-based agents whose URDF is auto-exported to a tempfile,
+    there is no adjacent SRDF. In that case, auto-generate one using
+    mplib's SRDF exporter and write it next to the URDF.
+    """
+    import os
+    srdf_path = agent.urdf_path.replace(".urdf", ".srdf")
+    if os.path.exists(srdf_path):
+        return srdf_path
+
+    # Auto-generate SRDF from the loaded articulation
+    import re as _re
+    import xml.etree.ElementTree as ET
+    from mplib.sapien_utils.srdf_exporter import export_srdf_xml
+
+    srdf_xml = export_srdf_xml(agent.robot._objs[0])
+    srdf_str = ET.tostring(srdf_xml, encoding="unicode")
+    # Strip scene prefix from link names to match the cleaned URDF.
+    # The exporter prefixes names with "scene-{N}-{agent_uid}_".
+    uid = agent.uid
+    srdf_str = _re.sub(rf'scene-\d+-{_re.escape(uid)}_', '', srdf_str)
+    with open(srdf_path, "w") as f:
+        f.write(srdf_str)
+    logger.info("Auto-generated SRDF at %s", srdf_path)
+    return srdf_path
+
+
 def setup_planner(env, robot_config: RobotConfig) -> mplib.Planner:
     """Create an mplib Planner from the env's robot.
 
@@ -166,9 +199,11 @@ def setup_planner(env, robot_config: RobotConfig) -> mplib.Planner:
     link_names = [link.get_name() for link in robot.get_links()]
     joint_names = [joint.get_name() for joint in robot.get_active_joints()]
 
+    srdf_path = _get_srdf_path(agent)
+
     planner = mplib.Planner(
         urdf=agent.urdf_path,
-        srdf=agent.urdf_path.replace(".urdf", ".srdf"),
+        srdf=srdf_path,
         user_link_names=link_names,
         user_joint_names=joint_names,
         move_group=robot_config.move_group,
@@ -259,11 +294,15 @@ def attach_object(planner, size, pose=None):
     Args:
         planner: mplib.Planner instance.
         size: (3,) array-like — full extents (x, y, z) of the box.
+            Clamped to a maximum of 0.06m per axis to avoid false
+            collisions with the robot's own links (OBB can overestimate
+            due to object rotation).
         pose: mplib.pymp.Pose — relative pose from the end-effector link
             to the object center.  Defaults to identity (centered on TCP).
     """
     if pose is None:
         pose = mplib.pymp.Pose()
+    size = np.clip(np.asarray(size, dtype=np.float64), 0, 0.06)
     planner.update_attached_box(size, pose)
     logger.debug("Attached box (%.3f, %.3f, %.3f) to end effector", *size)
 
@@ -283,8 +322,20 @@ def move_to_pose(env, planner, pose, gripper_state, robot_config: RobotConfig,
     Returns None on planning failure, the plan dict if dry_run=True,
     or the last (obs, reward, terminated, truncated, info) tuple.
     """
+    # If the target pose has identity orientation (default), use the current
+    # TCP orientation instead.  This avoids forcing a large rotation that
+    # hits joint limits or collisions for robots whose TCP frame at rest is
+    # far from identity (e.g. UR5).
+    raw = env.unwrapped
+    if np.allclose(pose.q, [1, 0, 0, 0], atol=1e-6):
+        tcp_q = raw.agent.tcp.pose.q.flatten().cpu().numpy()
+        pose = sapien.Pose(p=pose.p, q=tcp_q)
     goal = sapien_to_mplib_pose(pose)
-    current_qpos = env.unwrapped.agent.robot.get_qpos().cpu().numpy()[0]
+    current_qpos = raw.agent.robot.get_qpos().cpu().numpy()[0]
+    # Clamp qpos to joint limits — SAPIEN physics can push joints slightly
+    # outside URDF limits (e.g. gripper joints), which makes mplib reject.
+    limits = np.asarray(planner.joint_limits)
+    current_qpos = np.clip(current_qpos, limits[:, 0], limits[:, 1])
     result = planner.plan_screw(
         goal,
         current_qpos,

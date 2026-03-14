@@ -12,6 +12,7 @@ env:
   num_envs: 16
   max_episode_steps: 100
   num_cubes: null
+  robot_uids: null
   record_video: false
   render_mode: rgb_array
 

@@ -1,3 +1,4 @@
+import taskbench.agents  # noqa: F401 — registers custom agents (UR5, etc.)
 import taskbench.envs.bin_with_objects  # noqa: F401 — triggers env registration
 import taskbench.envs.shelf_env  # noqa: F401 — triggers env registration
 import taskbench.envs.stack_cube_distractor  # noqa: F401 — triggers env registration

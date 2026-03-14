@@ -13,6 +13,9 @@ def _env_kwargs(cfg):
     num_cubes = OmegaConf.select(cfg, "num_cubes", default=None)
     if num_cubes is not None:
         kwargs["num_cubes"] = num_cubes
+    robot_uids = OmegaConf.select(cfg, "robot_uids", default=None)
+    if robot_uids is not None:
+        kwargs["robot_uids"] = robot_uids
     return kwargs
 
 

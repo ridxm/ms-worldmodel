@@ -13,6 +13,7 @@ videos/
 videos_old/
 replay_videos/
 data/
+!data/robots/
 
 # OS
 .DS_Store
