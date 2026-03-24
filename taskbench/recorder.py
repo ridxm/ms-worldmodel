@@ -78,7 +78,11 @@ from typing import Any, Dict, List, Optional
 import h5py
 import numpy as np
 
-from taskbench.skills.motion import get_arm_drive_settings, get_gripper_contact_summary
+from taskbench.skills.motion import (
+    get_arm_drive_settings,
+    get_gripper_contact_summary,
+    get_robot_contact_summary,
+)
 
 logger = logging.getLogger("taskbench.recorder")
 
@@ -86,6 +90,15 @@ logger = logging.getLogger("taskbench.recorder")
 def _extract_gripper_contact_force(raw):
     """Return the current peak gripper contact force estimate in Newtons."""
     return float(get_gripper_contact_summary(raw)["peak_force"])
+
+
+def _extract_shelf_contact_force(raw):
+    """Return the current peak robot-shelf contact force estimate in Newtons."""
+    summary = get_robot_contact_summary(
+        raw,
+        entity_filter=lambda name: "shelf" in name.lower(),
+    )
+    return float(summary["peak_force"])
 
 
 def _extract_joint_load_l2(raw):
@@ -111,6 +124,7 @@ _ROBOT_FIELD_EXTRACTORS = {
     "tcp_quat": lambda raw: raw.agent.tcp.pose.q[0].detach().cpu().numpy(),
     "gripper_qpos": lambda raw: raw.agent.robot.get_qpos()[0].detach().cpu().numpy()[-2:],
     "gripper_contact_force": _extract_gripper_contact_force,
+    "shelf_contact_force": _extract_shelf_contact_force,
 }
 
 

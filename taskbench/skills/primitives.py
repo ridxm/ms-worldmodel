@@ -30,6 +30,8 @@ from taskbench.skills.motion import (
     attach_object,
     detach_object,
     get_arm_drive_settings,
+    get_robot_contact_summary,
+    hold_current_pose,
     move_to_pose,
     set_arm_drive_settings,
     to_sapien_pose,
@@ -90,6 +92,12 @@ class PushResult(SkillResult):
     joint_load_l2_peak: float = 0.0
     joint_load_l2_mean: float = 0.0
     contact_objects: tuple[str, ...] = ()
+    executed_push_distance: float = 0.0
+    executed_push_fraction: float = 0.0
+    cutoff_reason: Optional[str] = None
+    shelf_contact_force_peak: float = 0.0
+    shelf_contact_force_mean: float = 0.0
+    shelf_contact_objects: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -151,9 +159,12 @@ class Move(Skill):
     def __call__(self, target_pose: PoseLike, *, gripper_open=True,
                  monitor_contacts=True, diagnostics=None,
                  allowed_contact_links=None, control_hook=None,
+                 stop_hook=None,
                  time_step_scale=1.0,
                  refine_steps=0,
-                 contact_force_threshold=0.01) -> MoveResult:
+                 contact_force_threshold=0.01,
+                 allow_pose_planner_fallback=False,
+                 pose_planning_time=1.0) -> MoveResult:
         target_pose = to_sapien_pose(target_pose)
         rc = self.robot_config
         gripper_state = rc.gripper_open if gripper_open else rc.gripper_closed
@@ -163,10 +174,13 @@ class Move(Skill):
                            diagnostics=local_diagnostics,
                            allowed_contact_links=allowed_contact_links,
                            control_hook=control_hook,
+                           stop_hook=stop_hook,
                            step_callback=self.step_callback,
                            time_step_scale=time_step_scale,
                            refine_steps=refine_steps,
-                           contact_force_threshold=contact_force_threshold)
+                           contact_force_threshold=contact_force_threshold,
+                           allow_pose_planner_fallback=allow_pose_planner_fallback,
+                           pose_planning_time=pose_planning_time)
         if res is None:
             failure_reason = local_diagnostics.get("failure_reason", "move_plan_failed")
             return MoveResult(
@@ -353,6 +367,9 @@ class Push(Skill):
         hover_pose: Optional pre-descent pose directly above the approach pose.
             Useful when you want a smooth vertical lowering phase with more
             clearance around nearby objects.
+        transit_poses: Optional intermediate free-space waypoints executed
+            before the final approach. Useful for breaking a hard insertion
+            into shorter planner segments.
         approach_pose: PoseLike to move to before pushing (no contact).
         push_pose: PoseLike to sweep toward using a straight-line Cartesian
             motion (contact expected).
@@ -367,25 +384,46 @@ class Push(Skill):
             for the push to count as successful.
         *_speed_scale: Optional planner/control waypoint spacing multipliers
             for each phase. Values > 1 run faster with fewer waypoints.
+        staging_settle_steps: Optional hold steps after the staging move.
+            Useful when a later insertion plan is sensitive to small tracking
+            error at the staging waypoint.
+        transit_allowed_contact_links: Optional set of robot links that may
+            touch external objects during intermediate free-space waypoints.
+        approach_allowed_contact_links: Optional set of robot links that may
+            touch external objects during the final approach move.
     """
 
     def __call__(self, approach_pose: PoseLike, push_pose: PoseLike, *,
                  staging_pose: PoseLike | None = None,
                  hover_pose: PoseLike | None = None,
+                 transit_poses: list[PoseLike] | tuple[PoseLike, ...] | None = None,
                  clearance_height=0.1, lift_height=0.1,
                  effort_scale=1.0, effort_scale_end=None,
                  min_contact_force=0.0,
                  open_gripper_after_push=True,
                  staging_speed_scale=1.0,
+                 staging_settle_steps=0,
                  hover_speed_scale=1.0,
+                 transit_speed_scale=1.0,
                  clearance_speed_scale=1.0,
                  approach_speed_scale=1.0,
                  push_speed_scale=1.0,
-                 lift_speed_scale=1.0) -> PushResult:
+                 lift_speed_scale=1.0,
+                 transit_allowed_contact_links=None,
+                 approach_allowed_contact_links=None,
+                 push_abort_on_contact=True,
+                 push_cutoff_force_threshold=None,
+                 push_cutoff_entity_substrings=None,
+                 free_space_pose_planner_fallback=False,
+                 free_space_pose_planning_time=1.0) -> PushResult:
         if staging_pose is not None:
             staging_pose = to_sapien_pose(staging_pose)
         if hover_pose is not None:
             hover_pose = to_sapien_pose(hover_pose)
+        if transit_poses is None:
+            transit_poses = []
+        else:
+            transit_poses = [to_sapien_pose(pose) for pose in transit_poses]
         approach_pose = to_sapien_pose(approach_pose)
         push_pose = to_sapien_pose(push_pose)
         env, planner, rc = self.env, self.planner, self.robot_config
@@ -435,15 +473,27 @@ class Push(Skill):
                 staging_pose,
                 gripper_open=False,
                 time_step_scale=staging_speed_scale,
+                allow_pose_planner_fallback=free_space_pose_planner_fallback,
+                pose_planning_time=free_space_pose_planning_time,
             )
             if not result.success:
                 return PushResult(success=False, failure_reason="staging_move_failed", **base)
+            if int(staging_settle_steps) > 0:
+                hold_current_pose(
+                    env,
+                    planner,
+                    rc.gripper_closed,
+                    steps=int(staging_settle_steps),
+                    step_callback=self.step_callback,
+                )
 
         if hover_pose is not None:
             result = move(
                 hover_pose,
                 gripper_open=False,
                 time_step_scale=hover_speed_scale,
+                allow_pose_planner_fallback=free_space_pose_planner_fallback,
+                pose_planning_time=free_space_pose_planning_time,
             )
             if not result.success:
                 return PushResult(success=False, failure_reason="hover_move_failed", **base)
@@ -455,10 +505,15 @@ class Push(Skill):
             tcp_q = np.asarray(tcp_pose.q, dtype=np.float32).flatten()[:4]
             clearance_pose = sapien.Pose(
                 np.array([tcp_p[0], tcp_p[1], tcp_p[2] + clearance_height],
-                         dtype=np.float32),
+                    dtype=np.float32),
                 tcp_q,
             )
-            result = move(clearance_pose, time_step_scale=clearance_speed_scale)
+            result = move(
+                clearance_pose,
+                time_step_scale=clearance_speed_scale,
+                allow_pose_planner_fallback=free_space_pose_planner_fallback,
+                pose_planning_time=free_space_pose_planning_time,
+            )
             if not result.success:
                 return PushResult(success=False, failure_reason="clearance_lift_failed", **base)
 
@@ -466,17 +521,70 @@ class Push(Skill):
         actuate_gripper(env, planner, rc.gripper_closed,
                         step_callback=self.step_callback)
 
+        for transit_pose in transit_poses:
+            result = move(
+                transit_pose,
+                gripper_open=False,
+                time_step_scale=transit_speed_scale,
+                allowed_contact_links=transit_allowed_contact_links,
+                allow_pose_planner_fallback=free_space_pose_planner_fallback,
+                pose_planning_time=free_space_pose_planning_time,
+            )
+            if not result.success:
+                return PushResult(success=False, failure_reason="transit_move_failed", **base)
+
         # Approach — closed gripper, contact monitoring on
         result = move(
             approach_pose,
             gripper_open=False,
             time_step_scale=approach_speed_scale,
+            allowed_contact_links=approach_allowed_contact_links,
+            allow_pose_planner_fallback=free_space_pose_planner_fallback,
+            pose_planning_time=free_space_pose_planning_time,
         )
         if not result.success:
             return PushResult(success=False, failure_reason="approach_failed", **base)
 
         # Sweep — closed gripper, contact monitoring off (contact is intentional)
         diagnostics = {}
+
+        def _push_stop_hook(_env, _robot_config, _diagnostics, _step_idx, _num_steps):
+            summary = get_robot_contact_summary(_env)
+            _diagnostics.setdefault("robot_contact_force_samples", []).append(
+                float(summary["peak_force"])
+            )
+            _diagnostics.setdefault("robot_contact_entities", set()).update(
+                summary["other_entities"]
+            )
+
+            shelf_entities = ()
+            if push_cutoff_entity_substrings:
+                patterns = tuple(str(s).lower() for s in push_cutoff_entity_substrings)
+                shelf_summary = get_robot_contact_summary(
+                    _env,
+                    entity_filter=lambda name: any(
+                        pattern in name.lower() for pattern in patterns
+                    ),
+                )
+                shelf_entities = shelf_summary["other_entities"]
+                _diagnostics.setdefault("shelf_contact_force_samples", []).append(
+                    float(shelf_summary["peak_force"])
+                )
+                _diagnostics.setdefault("shelf_contact_entities", set()).update(
+                    shelf_entities
+                )
+                if shelf_entities:
+                    return "entity_contact_cutoff"
+            if push_cutoff_force_threshold is not None and (
+                summary["peak_force"] >= float(push_cutoff_force_threshold)
+            ):
+                return "force_cutoff"
+            return None
+
+        sweep_stop_hook = None
+        if push_cutoff_force_threshold is not None or push_cutoff_entity_substrings:
+            sweep_stop_hook = _push_stop_hook
+
         def _push_effort_hook(progress, _idx, _num_steps):
             scale = effort_scale + (effort_scale_end - effort_scale) * progress
             force_limit = np.asarray(base_force_limit_raw) * scale
@@ -489,10 +597,11 @@ class Push(Skill):
             result = move(
                 push_pose,
                 gripper_open=False,
-                monitor_contacts=True,
+                monitor_contacts=push_abort_on_contact,
                 allowed_contact_links=rc.gripper_link_names,
                 diagnostics=diagnostics,
                 control_hook=_push_effort_hook,
+                stop_hook=sweep_stop_hook,
                 time_step_scale=push_speed_scale,
             )
         finally:
@@ -516,6 +625,8 @@ class Push(Skill):
                 gripper_open=False,
                 monitor_contacts=False,
                 time_step_scale=lift_speed_scale,
+                allow_pose_planner_fallback=free_space_pose_planner_fallback,
+                pose_planning_time=free_space_pose_planning_time,
             )
             if not result.success:
                 logger.warning("Push lift failed, continuing anyway")
@@ -548,11 +659,23 @@ class Push(Skill):
             if joint_load_l2_samples else 0.0
         )
         contact_objects = tuple(sorted(diagnostics.get("contact_entities", ())))
+        robot_contact_force_samples = diagnostics.get("robot_contact_force_samples", [])
+        shelf_contact_force_samples = diagnostics.get("shelf_contact_force_samples", [])
+        shelf_contact_objects = tuple(sorted(diagnostics.get("shelf_contact_entities", ())))
         contact_steps = len(nonzero_contact_forces)
         success = contact_force_peak >= float(min_contact_force)
         failure_reason = None
         if not success:
             failure_reason = "insufficient_contact_force"
+        cutoff_reason = diagnostics.get("stop_reason")
+        stop_step = diagnostics.get("stop_step")
+        executed_push_fraction = 1.0
+        if stop_step is not None and push_distance > 1e-8:
+            executed_push_fraction = float(stop_step + 1) / max(
+                len(contact_force_samples), 1
+            )
+            executed_push_fraction = float(np.clip(executed_push_fraction, 0.0, 1.0))
+        executed_push_distance = push_distance * executed_push_fraction
 
         return PushResult(
             success=success,
@@ -579,4 +702,13 @@ class Push(Skill):
             joint_load_l2_peak=joint_load_l2_peak,
             joint_load_l2_mean=joint_load_l2_mean,
             contact_objects=contact_objects,
+            executed_push_distance=executed_push_distance,
+            executed_push_fraction=executed_push_fraction,
+            cutoff_reason=cutoff_reason,
+            shelf_contact_force_peak=max(shelf_contact_force_samples, default=0.0),
+            shelf_contact_force_mean=(
+                float(np.mean(shelf_contact_force_samples))
+                if shelf_contact_force_samples else 0.0
+            ),
+            shelf_contact_objects=shelf_contact_objects,
         )

@@ -340,6 +340,21 @@ def tcp_height_for_table_clearance(
     return float(table_z + table_clearance - min_z_rel)
 
 
+def tcp_height_for_pose_clearance(
+    agent,
+    tcp_quat_wxyz,
+    *,
+    plane_z=0.0,
+    plane_clearance=0.0,
+):
+    """Return the TCP z needed to keep gripper collision geometry above a plane."""
+    quat = np.asarray(tcp_quat_wxyz, dtype=np.float32).reshape(-1)[:4]
+    rotation = _pose_matrix([0.0, 0.0, 0.0], quat)[:3, :3]
+    tcp_points = get_gripper_collision_points_in_tcp(agent)
+    min_z_rel = float((rotation @ tcp_points.T).T[:, 2].min())
+    return float(plane_z + plane_clearance - min_z_rel)
+
+
 def make_linear_push_plan(
     agent,
     *,
@@ -580,8 +595,8 @@ def _add_table_collision(env, planner):
         logger.debug(
             "Added table collision: %d points at z=%.4f", len(points), top_z
         )
-        return
-    logger.warning("No table actor found in scene")
+        return True
+    return False
 
 
 def add_collision_boxes(planner, boxes, resolution=0.01):
@@ -599,6 +614,18 @@ def add_collision_boxes(planner, boxes, resolution=0.01):
         points = _box_surface_points(center, hs, resolution)
         planner.update_point_cloud(points, resolution=resolution, name=name)
         logger.debug("Added collision box '%s': %d points", name, len(points))
+
+
+def _add_env_collision_boxes(env, planner, *, resolution=0.02):
+    """Add static env collision boxes when the env exposes them."""
+    raw = env.unwrapped
+    if not hasattr(raw, "get_collision_boxes"):
+        return False
+    boxes = raw.get_collision_boxes()
+    if not boxes:
+        return False
+    add_collision_boxes(planner, boxes, resolution=resolution)
+    return True
 
 
 def _box_surface_points(center, half_size, res):
@@ -662,9 +689,69 @@ def setup_planner(env, robot_config: RobotConfig) -> mplib.Planner:
     planner.joint_vel_limits = np.asarray(planner.joint_vel_limits) * 0.9
     planner.joint_acc_limits = np.asarray(planner.joint_acc_limits) * 0.9
 
-    _add_table_collision(env, planner)
+    table_added = _add_table_collision(env, planner)
+    boxes_added = _add_env_collision_boxes(env, planner)
+    if not table_added and not boxes_added:
+        logger.warning("No static collision geometry found for planner setup")
 
     return planner
+
+
+def plan_to_pose(
+    env,
+    planner,
+    pose,
+    *,
+    start_qpos=None,
+    time_step_scale=1.0,
+    allow_pose_planner_fallback=False,
+    pose_planning_time=1.0,
+):
+    """Plan a motion to ``pose`` from ``start_qpos``.
+
+    The fast path uses ``plan_screw()``. When ``allow_pose_planner_fallback``
+    is enabled and the screw planner fails, this falls back to the more
+    general ``plan_pose()`` search in mplib.
+    """
+    time_step_scale = float(time_step_scale)
+    if time_step_scale <= 0:
+        raise ValueError("time_step_scale must be > 0")
+
+    goal = sapien_to_mplib_pose(pose)
+    if start_qpos is None:
+        start_qpos = env.unwrapped.agent.robot.get_qpos().cpu().numpy()[0]
+    current_qpos = np.asarray(start_qpos, dtype=np.float64)
+    time_step = env.unwrapped.control_timestep * time_step_scale
+
+    result = planner.plan_screw(
+        goal,
+        current_qpos,
+        time_step=time_step,
+    )
+    if result["status"] == "Success":
+        return result
+
+    if not allow_pose_planner_fallback:
+        logger.warning("plan_screw failed: %s", result["status"])
+        return None
+
+    logger.info("plan_screw failed (%s); falling back to plan_pose", result["status"])
+    if current_qpos.shape[0] != planner.joint_limits.shape[0]:
+        current_qpos = planner.pad_move_group_qpos(current_qpos.copy())
+    fallback = planner.plan_pose(
+        goal,
+        current_qpos,
+        time_step=time_step,
+        planning_time=float(pose_planning_time),
+        simplify=True,
+    )
+    if fallback["status"] != "Success":
+        logger.warning(
+            "plan_pose fallback failed after screw failure: %s",
+            fallback["status"],
+        )
+        return None
+    return fallback
 
 
 def _get_robot_contacts(env, robot_link_names=None):
@@ -753,6 +840,39 @@ def get_gripper_contact_summary(env, robot_config: RobotConfig | None = None):
     }
 
 
+def get_robot_contact_summary(
+    env,
+    *,
+    robot_link_names=None,
+    entity_filter=None,
+):
+    """Summarize current robot contacts as peak/total force and entities."""
+    raw = _unwrap_env(env)
+    peak_force = 0.0
+    total_force = 0.0
+    other_entities = set()
+
+    for contact, _link_name, other in _get_robot_contacts(
+        raw, robot_link_names=robot_link_names
+    ):
+        if entity_filter is not None and not entity_filter(other):
+            continue
+        force = sum(
+            np.linalg.norm(pt.impulse) for pt in contact.points
+        ) / raw.control_timestep
+        if force <= 0:
+            continue
+        peak_force = max(peak_force, float(force))
+        total_force += float(force)
+        other_entities.add(other)
+
+    return {
+        "peak_force": peak_force,
+        "total_force": total_force,
+        "other_entities": tuple(sorted(other_entities)),
+    }
+
+
 def _record_motion_diagnostics(env, robot_config: RobotConfig, diagnostics):
     """Accumulate per-step effort/contact telemetry during execution."""
     if diagnostics is None:
@@ -782,7 +902,7 @@ def _record_motion_diagnostics(env, robot_config: RobotConfig, diagnostics):
 def follow_path(env, result, gripper_state, robot_config: RobotConfig,
                 refine_steps=0, monitor_contacts=False, diagnostics=None,
                 allowed_contact_links=None, control_hook=None, step_callback=None,
-                contact_force_threshold=0.01):
+                contact_force_threshold=0.01, stop_hook=None):
     """Execute a planned path, returning the last step result.
 
     Args:
@@ -800,6 +920,10 @@ def follow_path(env, result, gripper_state, robot_config: RobotConfig,
             (e.g. ``env.render_human`` for live viewer updates).
         contact_force_threshold: Minimum contact magnitude treated as a
             disallowed collision when ``monitor_contacts=True``.
+        stop_hook: Optional callable receiving
+            ``(env, robot_config, diagnostics, step_idx, num_steps)`` and
+            returning a string reason to end the motion early without
+            treating it as a failure.
     """
     if allowed_contact_links is None:
         allowed_contact_links = set()
@@ -843,6 +967,14 @@ def follow_path(env, result, gripper_state, robot_config: RobotConfig,
             step_callback()
 
         _record_motion_diagnostics(env, robot_config, diagnostics)
+
+        if stop_hook is not None:
+            stop_reason = stop_hook(env, robot_config, diagnostics, i, n_step)
+            if stop_reason:
+                if diagnostics is not None:
+                    diagnostics["stop_reason"] = str(stop_reason)
+                    diagnostics["stop_step"] = int(i)
+                return obs, reward, terminated, truncated, info
 
         if monitor_contacts:
             violation = get_robot_contact_violation(
@@ -919,7 +1051,10 @@ def move_to_pose(env, planner, pose, gripper_state, robot_config: RobotConfig,
                  allowed_contact_links=None, control_hook=None,
                  step_callback=None, time_step_scale=1.0,
                  refine_steps=0,
-                 contact_force_threshold=0.01):
+                 contact_force_threshold=0.01,
+                 stop_hook=None,
+                 allow_pose_planner_fallback=False,
+                 pose_planning_time=1.0):
     """Plan and execute a straight-line motion to target pose.
 
     Uses ``plan_screw()`` (Cartesian straight-line interpolation).
@@ -935,15 +1070,15 @@ def move_to_pose(env, planner, pose, gripper_state, robot_config: RobotConfig,
     time_step_scale = float(time_step_scale)
     if time_step_scale <= 0:
         raise ValueError("time_step_scale must be > 0")
-    goal = sapien_to_mplib_pose(pose)
-    current_qpos = env.unwrapped.agent.robot.get_qpos().cpu().numpy()[0]
-    result = planner.plan_screw(
-        goal,
-        current_qpos,
-        time_step=env.unwrapped.control_timestep * time_step_scale,
+    result = plan_to_pose(
+        env,
+        planner,
+        pose,
+        time_step_scale=time_step_scale,
+        allow_pose_planner_fallback=allow_pose_planner_fallback,
+        pose_planning_time=pose_planning_time,
     )
-    if result["status"] != "Success":
-        logger.warning("plan_screw failed: %s", result["status"])
+    if result is None:
         return None
     if dry_run:
         return result
@@ -954,4 +1089,5 @@ def move_to_pose(env, planner, pose, gripper_state, robot_config: RobotConfig,
                        allowed_contact_links=allowed_contact_links,
                        control_hook=control_hook,
                        step_callback=step_callback,
-                       contact_force_threshold=contact_force_threshold)
+                       contact_force_threshold=contact_force_threshold,
+                       stop_hook=stop_hook)

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import sapien
+import sapien.physx as physx
 import sapien.render
 from mani_skill import ASSET_DIR
 from mani_skill.utils.io_utils import load_json
@@ -32,6 +33,9 @@ class ObjectGeometry:
     """Shape, physics, and visual style for objects in the push row."""
     kind: str = "bottle"
     density: float = 1800.0
+    static_friction: float = 0.22
+    dynamic_friction: float = 0.16
+    restitution: float = 0.02
     cylinder_radius: float = 0.018
     cylinder_half_length: float = 0.045
     body_radius: float = BOTTLE_BODY_RADIUS_BASE
@@ -55,11 +59,12 @@ def load_ycb_metadata(model_id: str) -> dict:
     return model_db[model_id]
 
 
-def add_bottle_collision(builder, obj: ObjectGeometry) -> None:
+def add_bottle_collision(builder, obj: ObjectGeometry, material=None) -> None:
     """Add bottle collision geometry (body + neck + ballast) to an actor builder."""
     builder.add_cylinder_collision(
         radius=obj.body_radius,
         half_length=obj.body_half_length,
+        material=material,
         density=obj.density,
     )
     neck_pose = sapien.Pose([obj.neck_offset, 0, 0])
@@ -67,6 +72,7 @@ def add_bottle_collision(builder, obj: ObjectGeometry) -> None:
         pose=neck_pose,
         radius=obj.neck_radius,
         half_length=obj.neck_half_length,
+        material=material,
         density=obj.density * obj.neck_density_scale,
     )
     ballast_pose = sapien.Pose([-obj.ballast_offset, 0, 0])
@@ -74,6 +80,7 @@ def add_bottle_collision(builder, obj: ObjectGeometry) -> None:
         pose=ballast_pose,
         radius=obj.ballast_radius,
         half_length=obj.ballast_half_length,
+        material=material,
         density=obj.density * obj.ballast_density_scale,
     )
 
@@ -114,7 +121,12 @@ def add_bottle_visual(builder, obj: ObjectGeometry, material) -> None:
 def build_bottle_actor(scene, obj: ObjectGeometry, idx: int, color) -> object:
     """Build a complete bottle actor with collision + visual geometry."""
     builder = scene.create_actor_builder()
-    add_bottle_collision(builder, obj)
+    phys_mat = physx.PhysxMaterial(
+        static_friction=float(obj.static_friction),
+        dynamic_friction=float(obj.dynamic_friction),
+        restitution=float(obj.restitution),
+    )
+    add_bottle_collision(builder, obj, material=phys_mat)
     add_bottle_visual(builder, obj, sapien.render.RenderMaterial(base_color=color))
     builder.initial_pose = sapien.Pose([0, 0, 1.0 + idx * 0.1])
     return builder.build(name=f"bottle_{idx}")

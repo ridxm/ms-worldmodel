@@ -1,0 +1,31 @@
+# @package _global_
+
+task:
+  env_id: ShelfBottleClutter-v1
+  robot_uids: panda
+  robot_base_pose: [-0.54, 0.0, 0.0]
+
+  num_bottles: 10
+  bottle_scale: 1.45
+  object_density: 1800.0
+  edge_margin: 0.008
+  placement_spacing: 0.062
+  placement_clearance: 0.002
+  placement_jitter: 0.003
+  layout_mode: auto
+  dense_layout_prob: 0.45
+  mixed_layout_prob: 0.45
+  random_yaw: true
+  movement_success_threshold: 0.02
+
+  shelf:
+    front_x: 0.26
+    depth: 0.22
+    half_w: 0.35
+    floor_z: 0.40
+    thickness: 0.01
+    inner_h: 0.35
+
+runtime:
+  reward_mode: none
+  record_video: false
