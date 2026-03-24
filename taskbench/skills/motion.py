@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import os
 from typing import TYPE_CHECKING, Tuple, Union
 
 import mplib
@@ -675,9 +676,19 @@ def setup_planner(env, robot_config: RobotConfig) -> mplib.Planner:
     link_names = [link.get_name() for link in robot.get_links()]
     joint_names = [joint.get_name() for joint in robot.get_active_joints()]
 
+    srdf_path = getattr(agent, "srdf_path", None)
+    if not srdf_path and hasattr(agent, "_srdf_tmp"):
+        srdf_path = getattr(agent._srdf_tmp, "name", None)
+    if not srdf_path:
+        srdf_path = agent.urdf_path.replace(".urdf", ".srdf")
+    if not os.path.exists(srdf_path):
+        raise FileNotFoundError(
+            f"Planner SRDF not found for robot {agent.uid!r}: {srdf_path}"
+        )
+
     planner = mplib.Planner(
         urdf=agent.urdf_path,
-        srdf=agent.urdf_path.replace(".urdf", ".srdf"),
+        srdf=srdf_path,
         user_link_names=link_names,
         user_joint_names=joint_names,
         move_group=robot_config.move_group,

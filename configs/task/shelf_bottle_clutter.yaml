@@ -2,8 +2,8 @@
 
 task:
   env_id: ShelfBottleClutter-v1
-  robot_uids: panda
-  robot_base_pose: [-0.54, 0.0, 0.0]
+  robot_uids: ur5e_robotiq
+  robot_base_pose: [-0.56, 0.0, 0.0]
 
   num_bottles: 10
   bottle_scale: 1.45

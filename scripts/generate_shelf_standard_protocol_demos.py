@@ -55,7 +55,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-seeds", type=int, default=200)
     parser.add_argument("--image-size", type=int, default=1024)
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--robot-base-x", type=float, default=-0.50)
+    parser.add_argument("--robot-uids", type=str, default="ur5e_robotiq")
+    parser.add_argument("--robot-base-x", type=float, default=-0.56)
     parser.add_argument(
         "--demo-mode",
         choices=("paired", "random-targets"),
@@ -101,7 +102,7 @@ def _make_cfg(args: argparse.Namespace):
             "seed": 0,
             "task": {
                 "env_id": "ShelfBottleClutter-v1",
-                "robot_uids": "panda",
+                "robot_uids": str(args.robot_uids),
                 "robot_base_pose": [float(args.robot_base_x), 0.0, 0.0],
                 "num_bottles": int(args.num_bottles),
                 "bottle_scale": 1.45,
@@ -151,7 +152,7 @@ def _make_env(args: argparse.Namespace, *, render_mode: str):
         max_episode_steps=800,
         sim_backend="cpu",
         render_mode=render_mode,
-        robot_uids="panda",
+        robot_uids=str(args.robot_uids),
         robot_base_pose=[float(args.robot_base_x), 0.0, 0.0],
         num_bottles=int(args.num_bottles),
         bottle_scale=1.45,
@@ -304,12 +305,11 @@ def _sample_push_endpoint(
     raw = env.unwrapped
     available = _directional_push_distance(raw, candidate, push_sign)
     capped_max = min(float(available), float(push_distance_max))
-    if capped_max <= 1e-6:
+    min_required = float(push_distance_min)
+    if capped_max < max(min_required, 1e-6):
         return None, 0.0
 
-    lower = min(float(push_distance_min), capped_max)
-    if lower <= 1e-6:
-        lower = min(0.04, capped_max)
+    lower = min_required
 
     # Randomize target distance but always include the far endpoint to avoid
     # pathological cases where all random samples are too small.

@@ -33,8 +33,8 @@ class ObjectGeometry:
     """Shape, physics, and visual style for objects in the push row."""
     kind: str = "bottle"
     density: float = 1800.0
-    static_friction: float = 0.22
-    dynamic_friction: float = 0.16
+    static_friction: float = 0.10
+    dynamic_friction: float = 0.07
     restitution: float = 0.02
     cylinder_radius: float = 0.018
     cylinder_half_length: float = 0.045
